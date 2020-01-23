@@ -1,129 +1,127 @@
-# Byte-compiled / optimized / DLL files
-__pycache__/
-*.py[cod]
-*$py.class
+# Function Name: launchConfigAMISync 
 
-# C extensions
-*.so
+# IAM: Added AutoScalingFullAccess to cfohub_launchconfig_amisync IAM role 
 
-# Distribution / packaging
-.Python
-build/
-develop-eggs/
-dist/
-downloads/
-eggs/
-.eggs/
-lib/
-lib64/
-parts/
-sdist/
-var/
-wheels/
-pip-wheel-metadata/
-share/python-wheels/
-*.egg-info/
-.installed.cfg
-*.egg
-MANIFEST
+from datetime import datetime 
+import json 
+import boto3 
 
-# PyInstaller
-#  Usually these files are written by a python script from a template
-#  before PyInstaller builds the exe, so as to inject date/other infos into it.
-*.manifest
-*.spec
+def lambda_handler(event, context): 
+debug = True 
+return_status = 200 
+return_body = 'Launch config update complete!' 
 
-# Installer logs
-pip-log.txt
-pip-delete-this-directory.txt
+as_client = boto3.client('autoscaling') 
+ec2_client = boto3.client('ec2') 
+ec2 = boto3.resource('ec2') 
 
-# Unit test / coverage reports
-htmlcov/
-.tox/
-.nox/
-.coverage
-.coverage.*
-.cache
-nosetests.xml
-coverage.xml
-*.cover
-*.py,cover
-.hypothesis/
-.pytest_cache/
+print ('\nLoading all autoscaling groups with the name "E-CFOHubASG".') 
+autoscaling_groups = as_client.describe_auto_scaling_groups( 
+AutoScalingGroupNames=[ 
+'CFOHubASG', 
+] 
+) 
+if autoscaling_groups['AutoScalingGroups']: 
+print ('\nIterating over all autoscaling groups.') 
+for ag in autoscaling_groups['AutoScalingGroups']: 
+cpm_managed = False 
+env = '' 
+name = '' 
+for tag in ag['Tags']: 
+if tag['Key'] == 'backup': 
+cpm_managed = True 
+if tag['Key'] == 'Environment': 
+env = tag['Value'] 
+if tag['Key'] == 'Name': 
+name = tag['Value'] 
 
-# Translations
-*.mo
-*.pot
+if cpm_managed: 
+print ('\nFound a CPM managed autoscaling group (' + ag['LaunchConfigurationName'] + '). Loading launch configuration.') 
+print (' ENV:' + env + ' NAME:' + name) 
+launch_configurations = as_client.describe_launch_configurations( 
+LaunchConfigurationNames=[ 
+ag['LaunchConfigurationName'], 
+] 
+) 
 
-# Django stuff:
-*.log
-local_settings.py
-db.sqlite3
-db.sqlite3-journal
+if launch_configurations['LaunchConfigurations']: 
+lc = next(iter(launch_configurations['LaunchConfigurations']), None) 
+print (' Loading current launch configuration AMI (' + lc['ImageId'] + ') details.') 
+current_ami = ec2.Image(lc['ImageId']) 
+print (' Loading all CPM AMIs.') 
+#newer_ami_list = ec2.images.filter(Filters=[{}]).all() 
+newer_ami_list = ec2_client.describe_images(Owners=['self'],Filters=[{'Name' : 'tag:Name', 'Values' : [name]},{'Name' : 'tag:Environment', 'Values' : [env]}]) 
+current_ami_creationdate = datetime.strptime(current_ami.creation_date, '%Y-%m-%dT%H:%M:%S.000Z') 
+latest_ami_creationdate = current_ami_creationdate 
+latest_ami_id = current_ami.image_id 
+print (' Iterating over all AMIs, searching for a new one.') 
+for ami in newer_ami_list['Images']: 
+ami_creationdate = datetime.strptime(ami['CreationDate'], '%Y-%m-%dT%H:%M:%S.000Z') 
+if (ami_creationdate > latest_ami_creationdate): 
+latest_ami_creationdate = ami_creationdate 
+latest_ami_id = ami['ImageId'] 
 
-# Flask stuff:
-instance/
-.webassets-cache
+if latest_ami_id != current_ami.image_id: 
+print ("\nFound a new AMI. Creating a new launch configuration.") 
+print (" Latest AMI CreationDate: " + latest_ami_creationdate.strftime('%Y-%m-%dT%H:%M:%S.000Z')) 
+print (" Latest AMI ID: " + latest_ami_id) 
+new_lc = lc 
+new_lc.pop('LaunchConfigurationARN') 
+new_lc.pop('CreatedTime') 
+if new_lc['KernelId'] == '': 
+new_lc.pop('KernelId') 
+if new_lc['RamdiskId'] == '': 
+new_lc.pop('RamdiskId') 
+new_lc_name = 'CFOHubASG' + env + '_' + datetime.now().strftime('%Y%m%d%H%M%S') 
+new_lc['LaunchConfigurationName'] = new_lc_name 
+new_lc_resp = as_client.create_launch_configuration(**new_lc) 
+print (new_lc_resp) 
+if new_lc_resp['ResponseMetadata']['HTTPStatusCode'] == 200: 
+print (' Launch configuration ' + new_lc_name + ' created.') 
 
-# Scrapy stuff:
-.scrapy
+print ('\nUpdating autoscaling group.') 
+if not debug: 
+updated_ag_resp = as_client.update_auto_scaling_group( 
+AutoScalingGroupName = ag['AutoScalingGroupName'], 
+LaunchConfigurationName = new_lc_name, 
+) 
 
-# Sphinx documentation
-docs/_build/
+if debug or updated_ag_resp['ResponseMetadata']['HTTPStatusCode'] == 200: 
+print (' Autoscaling group updated successfully.') 
+else: 
+return_status = 500 
+return_body = "Failed to update autoscaling group." 
 
-# PyBuilder
-target/
+else: 
+return_status = 500 
+return_body = "Failed to create new launch configuration." 
 
-# Jupyter Notebook
-.ipynb_checkpoints
+# Grab all of the launch configurations for this auto scaling group and delete all but the 4 newest configs 
+print ('Cleaning up old launch configurations') 
+resp = as_client.describe_launch_configurations() 
+paginator = as_client.get_paginator('describe_launch_configurations') 
+launch_configs = paginator.paginate().build_full_result() 
+lc_list = {} 
 
-# IPython
-profile_default/
-ipython_config.py
+for lc in launch_configs['LaunchConfigurations']: 
+if lc['LaunchConfigurationName'].startswith('CFOHubASG' + env + '_'): 
+createdate_str = lc['LaunchConfigurationName'].rsplit('_')[-1] 
+createdate_date = datetime.strptime(createdate_str, '%Y%m%d%H%M%S') 
+createdate_timestamp = createdate_date.timestamp() 
+lc_list[createdate_timestamp] = lc['LaunchConfigurationName'] 
 
-# pyenv
-.python-version
+if len(lc_list) > 4: 
+to_be_deleted_ctr = len(lc_list) - 4 
+for key in sorted(lc_list.keys()): 
+print ("Deleting launch config: " + lc_list[key]) 
+response = as_client.delete_launch_configuration( 
+LaunchConfigurationName = lc_list[key] 
+) 
+to_be_deleted_ctr -= 1 
+if to_be_deleted_ctr <= 0: 
+break 
 
-# pipenv
-#   According to pypa/pipenv#598, it is recommended to include Pipfile.lock in version control.
-#   However, in case of collaboration, if having platform-specific dependencies or dependencies
-#   having no cross-platform support, pipenv may install dependencies that don't work, or not
-#   install all needed dependencies.
-#Pipfile.lock
-
-# PEP 582; used by e.g. github.com/David-OConnor/pyflow
-__pypackages__/
-
-# Celery stuff
-celerybeat-schedule
-celerybeat.pid
-
-# SageMath parsed files
-*.sage.py
-
-# Environments
-.env
-.venv
-env/
-venv/
-ENV/
-env.bak/
-venv.bak/
-
-# Spyder project settings
-.spyderproject
-.spyproject
-
-# Rope project settings
-.ropeproject
-
-# mkdocs documentation
-/site
-
-# mypy
-.mypy_cache/
-.dmypy.json
-dmypy.json
-
-# Pyre type checker
-.pyre/
+return { 
+"statusCode": return_status, 
+"body": json.dumps(return_body) 
+} 
